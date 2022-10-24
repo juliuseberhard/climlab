@@ -194,6 +194,133 @@ class P2Albedo(DiagnosticProcess):
         self.albedo = Field(albedo, domain=dom)
 
 
+class P2AlbedoInhomogeneous(DiagnosticProcess):
+    """A class for parabolic distributed albedo values across the domain
+    on basis of the second order Legendre polynomial, allowing spatially
+    varying parameters.
+
+    Calculates the latitude dependent albedo values as
+
+    .. math::
+
+         \\alpha(\\varphi) = a_0(\\varphi) + a_2(\\varphi) P_2(x)
+
+    where :math:`P_2(x) = \\frac{1}{2} (3x^2 - 1)` is the second order Legendre Polynomial
+    and :math:`x=sin(\\varphi)`.
+
+    **Initialization parameters** \n
+
+    :param Field a0:    basic parameter for albedo function [default: 0.33 everywhere]
+    :param Field a2:    factor for second Legendre polynomial term in albedo
+                        function [default: 0.25 everywhere]
+
+    **Object attributes** \n
+
+    Additional to the parent class
+    :class:`~climlab.process.diagnostic.DiagnosticProcess`
+    following object attributes are generated and updated during initialization:
+
+    :ivar Field a0:                 attribute to store the albedo parameter a0.
+                                    During initialization the
+                                    :func:`a0` setter is called.
+    :ivar Field a2:                 attribute to store the albedo parameter a2.
+                                    During initialization the
+                                    :func:`a2` setter is called.
+    :ivar dict diagnostics:         key ``'albedo'`` initialized
+    :ivar Field albedo:             the subprocess attribute ``self.albedo`` is
+                                    created with correct dimensions
+                                    (according to ``self.lat``)
+
+    :Example:
+
+        Creation of a parabolic albedo subprocess on basis of an EBM domain::
+
+            >>> import climlab
+            >>> from climlab.surface.albedo import P2AlbedoInhomogeneous
+
+#            >>> # model creation
+#            >>> model = climlab.EBM()
+#
+#            >>> # modify a0 and a2 values in model parameter dictionary
+#            >>> model.param['a0']=0.35
+#            >>> model.param['a2']= 0.10
+#
+#            >>> # subprocess creation
+#            >>> p2_alb = P2AlbedoInhomogeneous(domains=model.domains['Ts'], **model.param)
+#
+#            >>> p2_alb.a0
+#            0.33
+#            >>> p2_alb.a2
+#            0.1
+
+
+    """
+
+    # Implemented by J. Eberhard (2022-10-21)
+
+    def __init__(self, a0=0.33, a2=0.25, **kwargs):
+        super(P2AlbedoInhomogeneous, self).__init__(**kwargs)
+        self.a0 = a0
+        self.a2 = a2
+        self.add_diagnostic('albedo')
+        self._compute_fixed()
+
+    @property
+    def a0(self):
+        """Property of albedo parameter a0.
+
+        :getter:    Returns the albedo parameter value which is stored in attribute
+                    ``self._a0``
+        :setter:    * sets albedo parameter which is addressed as ``self._a0``
+                      to the new value
+                    * updates the parameter dictionary ``self.param['a0']``
+                    * calls method :func:`_compute_fixed`
+        :type:      Field
+
+        """
+        return self._a0
+    @a0.setter
+    def a0(self, value):
+        self._a0 = value
+        self.param['a0'] = value
+        self._compute_fixed()
+    @property
+    def a2(self):
+        """Property of albedo parameter a2.
+
+        :getter:    Returns the albedo parameter value which is stored in attribute
+                    ``self._a2``
+        :setter:    * sets albedo parameter which is addressed as ``self._a2``
+                      to the new value
+                    * updates the parameter dictionary ``self.param['a2']``
+                    * calls method :func:`_compute_fixed`
+        :type:      Field
+
+        """
+        return self._a2
+    @a2.setter
+    def a2(self, value):
+        self._a2 = value
+        self.param['a2'] = value
+        self._compute_fixed()
+
+    def _compute_fixed(self):
+        '''Recompute any fixed quantities after a change in parameters'''
+        try:
+            lon, lat = np.meshgrid(self.lon, self.lat)
+        except:
+            lat = self.lat
+        phi = np.deg2rad(lat)
+        try:
+            albedo = self.a0 + self.a2 * P2(np.sin(phi))
+        except:
+            albedo = np.zeros_like(phi)
+        # make sure that the diagnostic has the correct field dimensions.
+        #dom = self.domains['default']
+        #  this is a more robust way to get the single value from dictionary:
+        dom = next(iter(self.domains.values()))
+        self.albedo = Field(albedo, domain=dom)
+
 
 class Iceline(DiagnosticProcess):
     """A class for an Iceline subprocess.
@@ -361,6 +488,101 @@ class StepFunctionAlbedo(DiagnosticProcess):
         sfc = self.domains['Ts']
         self.add_subprocess('iceline', Iceline(Tf=Tf, state=self.state, timestep=self.timestep))
         warm = P2Albedo(a0=a0, a2=a2, domains=sfc, timestep=self.timestep)
+        cold = ConstantAlbedo(albedo=ai, domains=sfc, timestep=self.timestep)
+        # remove `albedo` from the diagnostics list for the two subprocesses
+        #  because they cause conflicts when passed up the subprocess tree
+        for proc in [warm, cold]:
+            proc._diag_vars.remove('albedo')
+        self.add_subprocess('warm_albedo', warm)
+        self.add_subprocess('cold_albedo', cold)
+        self.topdown = False  # call subprocess compute methods first
+        self.add_diagnostic('albedo', self._get_current_albedo())
+
+    def _get_current_albedo(self):
+        '''Simple step-function albedo based on ice line at temperature Tf.'''
+        ice = self.subprocess['iceline'].ice
+        # noice = self.subprocess['iceline'].diagnostics['noice']
+        cold_albedo = self.subprocess['cold_albedo'].albedo
+        warm_albedo = self.subprocess['warm_albedo'].albedo
+        albedo = Field(np.where(ice, cold_albedo, warm_albedo), domain=self.domains['Ts'])
+        return albedo
+
+    def _compute(self):
+        self.albedo[:] = self._get_current_albedo()
+        return {}
+
+
+class StepFunctionAlbedoInhomogeneous(DiagnosticProcess):
+    """A step function albedo suprocess, allowing spatially varying parameters.
+
+    This class itself defines three subprocesses that are created during
+    initialization:
+
+        * ``'iceline'`` - :class:`Iceline`
+        * ``'warm_albedo'`` - :class:`P2AlbedoInhomogeneous`
+        * ``'cold_albedo'`` - :class:`ConstantAlbedo`
+
+    **Initialization parameters** \n
+
+    :param float Tf:    freezing temperature for Iceline subprocess     \n
+                        - unit: :math:`^{\circ} \\textrm{C}`            \n
+                        - default value: ``-10``
+    :param Field a0:    basic parameter for P2AlbedoInhomogeneous subprocess
+                        [default: 0.3]
+    :param Field a2:    factor for second Legendre polynomial term in
+                        P2AlbedoInhomogeneous subprocess [default: 0.078]
+    :param float ai:    ice albedo value for ConstantAlbedo subprocess
+                        [default: 0.62]
+
+    Additional to the parent class
+    :class:`~climlab.process.diagnostic.DiagnosticProcess`
+    following object attributes are generated/updated during initialization:
+
+    :ivar dict param:               The parameter dictionary is updated with
+                                    a couple of the initialization input
+                                    arguments, namely ``'Tf'``, ``'a0'``,
+                                    ``'a2'`` and ``'ai'``.
+    :ivar bool topdown:             is set to ``False`` to call subprocess
+                                    compute method first
+    :ivar dict diagnostics:         key ``'albedo'`` initialized
+    :ivar Field albedo:             the subprocess attribute ``self.albedo`` is
+                                    created
+
+    :Example:
+
+        Creation of a step albedo subprocess on basis of an EBM domain::
+
+            >>> import climlab
+            >>> from climlab.surface.albedo import StepFunctionAlbedoInhomogeneous
+            >>>
+#            >>> model = climlab.EBM(a0=0.29, a2=0.1, ai=0.65, Tf=-2)
+#            >>>
+#            >>> step_alb = StepFunctionAlbedo(state= model.state, **model.param)
+#            >>>
+#            >>> print step_alb
+#            climlab Process of type <class 'climlab.surface.albedo.StepFunctionAlbedo'>.
+#            State variables and domain shapes:
+#              Ts: (90, 1)
+#            The subprocess tree:
+#            top: <class 'climlab.surface.albedo.StepFunctionAlbedoInhomogeneous'>
+#               iceline: <class 'climlab.surface.albedo.Iceline'>
+#               cold_albedo: <class 'climlab.surface.albedo.ConstantAlbedo'>
+#               warm_albedo: <class 'climlab.surface.albedo.P2AlbedoInhomogeneous'>
+
+    """
+
+    # Implemented by J. Eberhard (2022-10-21)
+
+    def __init__(self, Tf=-10., a0=0.3, a2=0.078, ai=0.62, **kwargs):
+        super(StepFunctionAlbedoInhomogeneous, self).__init__(**kwargs)
+        self.param['Tf'] = Tf
+        self.param['a0'] = a0
+        self.param['a2'] = a2
+        self.param['ai'] = ai
+        sfc = self.domains['Ts']
+        self.add_subprocess('iceline', Iceline(Tf=Tf, state=self.state, timestep=self.timestep))
+        warm = P2AlbedoInhomogeneous(a0=a0, a2=a2, domains=sfc,
+                                     timestep=self.timestep)
         cold = ConstantAlbedo(albedo=ai, domains=sfc, timestep=self.timestep)
         # remove `albedo` from the diagnostics list for the two subprocesses
         #  because they cause conflicts when passed up the subprocess tree
